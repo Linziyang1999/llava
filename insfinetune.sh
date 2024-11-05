@@ -1,0 +1,1 @@
+launch --memory 400 --gpu 1 --cpu 30 --type a100-80g -- bash scripts/v1_6/finetune_ins.sh

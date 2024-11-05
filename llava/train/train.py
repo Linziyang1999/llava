@@ -36,6 +36,7 @@ from llava.model import *
 from llava.mm_utils import tokenizer_image_token
 
 from PIL import Image
+from llava.mm_utils import process_anyres_image
 
 
 local_rank = None
@@ -64,6 +65,9 @@ class ModelArguments:
     mm_use_im_patch_token: bool = field(default=True)
     mm_patch_merge_type: Optional[str] = field(default='flat')
     mm_vision_select_feature: Optional[str] = field(default="patch")
+    
+    
+
 
 
 @dataclass
@@ -73,7 +77,9 @@ class DataArguments:
     lazy_preprocess: bool = False
     is_multimodal: bool = False
     image_folder: Optional[str] = field(default=None)
-    image_aspect_ratio: str = 'square'
+    image_aspect_ratio: str = 'anyres'
+    image_grid_pinpoints: List[List[int]] = field(default_factory=lambda: [[336, 672], [672, 336], [672, 672], [1008, 336], [336, 1008]])
+
 
 
 @dataclass
@@ -82,6 +88,8 @@ class TrainingArguments(transformers.TrainingArguments):
     optim: str = field(default="adamw_torch")
     remove_unused_columns: bool = field(default=False)
     freeze_mm_mlp_adapter: bool = field(default=False)
+    freeze_mm_vision_resampler: bool = field(default= False)
+    unfreeze_mm_vision_tower: bool = field(default = False)
     mpt_attn_impl: Optional[str] = field(default="triton")
     model_max_length: int = field(
         default=512,
@@ -684,6 +692,11 @@ class LazySupervisedDataset(Dataset):
     def modality_lengths(self):
         length_list = []
         for sample in self.list_data_dict:
+            for conv in sample['conversations']:
+                obj = conv['value']
+                if not isinstance(obj, str):
+                    print(sample['id'] + " is dict")
+                    print(obj)
             cur_len = sum(len(conv['value'].split()) for conv in sample['conversations'])
             cur_len = cur_len if 'image' in sample else -cur_len
             length_list.append(cur_len)
@@ -698,7 +711,10 @@ class LazySupervisedDataset(Dataset):
             image_file = self.list_data_dict[i]['image']
             image_folder = self.data_args.image_folder
             processor = self.data_args.image_processor
+            image_grid_pinpoints = self.data_args.image_grid_pinpoints
             image = Image.open(os.path.join(image_folder, image_file)).convert('RGB')
+            image_size = image.size
+            #print(image_size)
             if self.data_args.image_aspect_ratio == 'pad':
                 def expand2square(pil_img, background_color):
                     width, height = pil_img.size
@@ -714,6 +730,8 @@ class LazySupervisedDataset(Dataset):
                         return result
                 image = expand2square(image, tuple(int(x*255) for x in processor.image_mean))
                 image = processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
+            elif self.data_args.image_aspect_ratio == "anyres":
+                image = process_anyres_image(image, processor, image_grid_pinpoints)
             else:
                 image = processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
             sources = preprocess_multimodal(
@@ -732,10 +750,12 @@ class LazySupervisedDataset(Dataset):
         # image exist in the data
         if 'image' in self.list_data_dict[i]:
             data_dict['image'] = image
+            data_dict['image_size'] = image_size
         elif self.data_args.is_multimodal:
             # image does not exist in the data, but the model is multimodal
             crop_size = self.data_args.image_processor.crop_size
             data_dict['image'] = torch.zeros(3, crop_size['height'], crop_size['width'])
+        
         return data_dict
 
 
@@ -769,7 +789,10 @@ class DataCollatorForSupervisedDataset(object):
                 batch['images'] = torch.stack(images)
             else:
                 batch['images'] = images
-
+        if 'image_size' in instances[0]:
+            image_sizes = [instance['image_size'] for instance in instances]
+            #print("has image_size")
+            batch['image_sizes'] = image_sizes
         return batch
 
 
@@ -791,6 +814,7 @@ def train(attn_implementation=None):
     parser = transformers.HfArgumentParser(
         (ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+
     local_rank = training_args.local_rank
     compute_dtype = (torch.float16 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32))
 
@@ -823,6 +847,15 @@ def train(attn_implementation=None):
                 cache_dir=training_args.cache_dir,
                 **bnb_model_from_pretrained_args
             )
+        elif 'mistral' in model_args.model_name_or_path:
+            model = LlavaMistralForCausalLM.from_pretrained(
+                model_args.model_name_or_path,
+                cache_dir=training_args.cache_dir,
+                attn_implementation=attn_implementation,
+                torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
+                **bnb_model_from_pretrained_args
+            )
+            
         else:
             model = LlavaLlamaForCausalLM.from_pretrained(
                 model_args.model_name_or_path,
@@ -831,6 +864,7 @@ def train(attn_implementation=None):
                 torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
                 **bnb_model_from_pretrained_args
             )
+            
     else:
         model = transformers.LlamaForCausalLM.from_pretrained(
             model_args.model_name_or_path,
@@ -839,8 +873,10 @@ def train(attn_implementation=None):
             torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
             **bnb_model_from_pretrained_args
         )
-    model.config.use_cache = False
 
+    print("use_cache")
+    model.config.use_cache = False
+    
     if model_args.freeze_backbone:
         model.model.requires_grad_(False)
 
@@ -887,7 +923,7 @@ def train(attn_implementation=None):
             model_args.model_name_or_path,
             cache_dir=training_args.cache_dir,
             model_max_length=training_args.model_max_length,
-            padding_side="right",
+            padding_side="left",
             use_fast=False,
         )
 
@@ -920,6 +956,7 @@ def train(attn_implementation=None):
         data_args.is_multimodal = True
 
         model.config.image_aspect_ratio = data_args.image_aspect_ratio
+        model.config.image_grid_pinpoints = data_args.image_grid_pinpoints
         model.config.tokenizer_padding_side = tokenizer.padding_side
         model.config.tokenizer_model_max_length = tokenizer.model_max_length
 
@@ -933,6 +970,9 @@ def train(attn_implementation=None):
         if training_args.freeze_mm_mlp_adapter:
             for p in model.get_model().mm_projector.parameters():
                 p.requires_grad = False
+        model.config.unfreeze_mm_vision_tower = training_args.unfreeze_mm_vision_tower
+        if training_args.unfreeze_mm_vision_tower:
+            vision_tower.requires_grad_(True)
 
         if training_args.bits in [4, 8]:
             model.get_model().mm_projector.to(dtype=compute_dtype, device=training_args.device)
@@ -956,6 +996,9 @@ def train(attn_implementation=None):
                     if training_args.bf16 and module.weight.dtype == torch.float32:
                         module = module.to(torch.bfloat16)
 
+    for name, param in model.named_parameters():
+        print(f"{name}: {param.requires_grad}")
+
     data_module = make_supervised_data_module(tokenizer=tokenizer,
                                               data_args=data_args)
     trainer = LLaVATrainer(model=model,
@@ -963,9 +1006,20 @@ def train(attn_implementation=None):
                     args=training_args,
                     **data_module)
 
-    if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
+    # if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
+    #     print("111111")
+    #     trainer.train(resume_from_checkpoint=True)
+    # else:
+    #     trainer.train()
+    checkpoints = list(pathlib.Path(training_args.output_dir).glob("checkpoint-*"))
+    print("检查点目录：", checkpoints)
+
+    if checkpoints:
+        print("111111")
         trainer.train(resume_from_checkpoint=True)
     else:
+        print("没有找到检查点，将从头开始训练")
+        # 启动不带 checkpoint 继续训练的代码，例如：
         trainer.train()
     trainer.save_state()
 

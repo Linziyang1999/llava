@@ -37,19 +37,22 @@ class LlavaMistralModel(LlavaMetaModel, MistralModel):
 
     def __init__(self, config: MistralConfig):
         super(LlavaMistralModel, self).__init__(config)
+        print("load llava mistral")
 
 
 class LlavaMistralForCausalLM(MistralForCausalLM, LlavaMetaForCausalLM):
     config_class = LlavaMistralConfig
 
     def __init__(self, config):
+        #跳过misralforcasuallm初始化
         super(MistralForCausalLM, self).__init__(config)
+        print("load llava mistral for causal lm")
         self.model = LlavaMistralModel(config)
-
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
         # Initialize weights and apply final processing
         self.post_init()
+        print("init end")
 
     def get_model(self):
         return self.model
@@ -145,6 +148,7 @@ class LlavaMistralForCausalLM(MistralForCausalLM, LlavaMetaForCausalLM):
                                       inputs_embeds=None, **kwargs):
         images = kwargs.pop("images", None)
         image_sizes = kwargs.pop("image_sizes", None)
+        #print(image_sizes)
         inputs = super().prepare_inputs_for_generation(
             input_ids, past_key_values=past_key_values, inputs_embeds=inputs_embeds, **kwargs
         )
